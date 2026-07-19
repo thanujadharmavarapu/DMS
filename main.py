@@ -1,143 +1,89 @@
-import cv2
+"""
+main.py
+-------
+Entry point that wires together:
+  - CameraWorker  (background thread: cv2 + MediaPipe + EAR/head-pose)
+  - queue.Queue   (thread-safe hand-off, camera -> GUI)
+  - SafetyDashboard (Tkinter mainloop, main thread only)
+  - Alarm         (audio cue, triggered from the main thread)
+
+This is the only place that starts/stops the thread, so shutdown is
+centralized and safe: closing the window sets a threading.Event, the
+camera thread notices it on its next loop iteration and releases the
+webcam, and only then does the Tk root get destroyed.
+"""
+
+import queue
+import threading
+import tkinter as tk
 
 import config
-from detector import FaceDetector
-from drowsiness import DrowsinessDetector
-from head_pose import HeadPoseEstimator
 from alert import Alarm
-from utils import draw_circle, draw_status_panel
+from camera_worker import CameraWorker
+from dashboard import SafetyDashboard
 
 
-def run():
+class App:
 
-    cap = cv2.VideoCapture(config.CAMERA_INDEX)
+    def __init__(self):
+        self.data_queue = queue.Queue(maxsize=config.QUEUE_MAXSIZE)
+        self.stop_event = threading.Event()
 
-    face_detector = FaceDetector()
-    drowsiness_detector = DrowsinessDetector()
-    head_pose_estimator = HeadPoseEstimator()
-    alarm = Alarm(config.ALARM_SOUND)
+        self.alarm = Alarm(config.ALARM_SOUND)
 
-    while True:
-
-        success, frame = cap.read()
-
-        if not success:
-            break
-
-        frame = cv2.flip(frame, 1)
-
-        face = face_detector.detect_face(frame)
-
-        # ------------------------------------------------------------
-        # No face -> everything off, everything reset
-        # ------------------------------------------------------------
-        if face is None:
-
-            alarm.stop()
-            drowsiness_detector.reset()
-            head_pose_estimator.reset()
-            face_detector.reset()
-
-            draw_status_panel(
-                frame,
-                [("NO FACE DETECTED", config.WARNING_COLOR)]
-            )
-
-            cv2.imshow(config.WINDOW_NAME, frame)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-            continue
-
-        # ------------------------------------------------------------
-        # Face present -> compute EAR
-        # ------------------------------------------------------------
-        left_eye, right_eye = face_detector.get_eye_points(face, frame)
-
-        for point in left_eye:
-            draw_circle(frame, point)
-        for point in right_eye:
-            draw_circle(frame, point)
-
-        ear = drowsiness_detector.get_average_ear(left_eye, right_eye)
-
-        # Head pose (yaw only matters -> LEFT/RIGHT/NORMAL)
-        pose, _ = head_pose_estimator.estimate(face, frame)
-        yaw = pose[1] if pose is not None else head_pose_estimator.baseline_yaw
-
-        # ------------------------------------------------------------
-        # Calibration phase (first ~3 seconds): look straight, eyes open
-        # ------------------------------------------------------------
-        if not drowsiness_detector.calibrated or not head_pose_estimator.calibrated:
-
-            drowsiness_detector.calibrate(ear)
-            head_pose_estimator.calibrate(yaw)
-
-            draw_status_panel(
-                frame,
-                [
-                    ("CALIBRATING...", config.TEXT_COLOR),
-                    ("PLEASE LOOK STRAIGHT", config.TEXT_COLOR),
-                    ("KEEP YOUR EYES OPEN", config.TEXT_COLOR),
-                ]
-            )
-
-            cv2.imshow(config.WINDOW_NAME, frame)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-            continue
-
-        # ------------------------------------------------------------
-        # Normal monitoring (post-calibration)
-        # ------------------------------------------------------------
-        fatigue = drowsiness_detector.detect(ear)
-
-        head_position = head_pose_estimator.get_head_position(yaw)
-        look_away = head_pose_estimator.detect_look_away(head_position)
-
-        # Single, non-overlapping driver state.
-        # Fatigue (microsleep) takes priority since it is the more
-        # immediately dangerous condition if both were ever true at once.
-        if fatigue:
-            status = "FATIGUE DETECTED"
-            status_color = config.WARNING_COLOR
-        elif look_away:
-            status = "LOOK AWAY DETECTED"
-            status_color = config.WARNING_COLOR
-        else:
-            status = "NORMAL"
-            status_color = config.TEXT_COLOR
-
-        # Alarm only during FATIGUE or LOOK AWAY
-        if fatigue or look_away:
-            alarm.start()
-        else:
-            alarm.stop()
-
-        # ------------------------------------------------------------
-        # Clean UI: EAR, Head Position, STATUS -- nothing else
-        # ------------------------------------------------------------
-        draw_status_panel(
-            frame,
-            [
-                (f"EAR : {ear:.2f}", config.TEXT_COLOR),
-                (f"Head Position : {head_position}", config.TEXT_COLOR),
-                (f"STATUS : {status}", status_color),
-            ]
+        self.worker = CameraWorker(self.data_queue, self.stop_event)
+        self.camera_thread = threading.Thread(
+            target=self.worker.run,
+            name="CameraWorkerThread",
+            daemon=True,   # safety net: won't block interpreter exit even
+                           # if graceful shutdown is somehow skipped
         )
 
-        cv2.imshow(config.WINDOW_NAME, frame)
+        self.root = tk.Tk()
+        self.dashboard = SafetyDashboard(
+            self.root,
+            self.data_queue,
+            on_close_callback=self.shutdown,
+        )
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        # Drive the alarm from the dashboard's live state, on the main
+        # thread, right after each GUI tick -- avoids any cross-thread
+        # audio calls while still reacting within ~20ms of a state change.
+        self._hook_alarm_to_dashboard()
 
-    alarm.stop()
-    cap.release()
-    cv2.destroyAllWindows()
+    # ------------------------------------------------------------
+
+    def _hook_alarm_to_dashboard(self):
+        original_tick = self.dashboard.tick
+
+        def tick_with_alarm():
+            original_tick()
+            if self.dashboard.state in ("FATIGUE", "DISTRACTED"):
+                self.alarm.start()
+            else:
+                self.alarm.stop()
+
+        self.dashboard.tick = tick_with_alarm
+
+    # ------------------------------------------------------------
+
+    def run(self):
+        self.camera_thread.start()
+        self.root.mainloop()
+
+    # ------------------------------------------------------------
+
+    def shutdown(self):
+        """Called once, from the Tk WM_DELETE_WINDOW handler."""
+        self.stop_event.set()
+        self.alarm.stop()
+
+        # Give the camera thread a moment to notice the stop flag,
+        # finish its current frame, and release cv2.VideoCapture.
+        self.camera_thread.join(timeout=2.0)
+
+        self.root.destroy()
 
 
 if __name__ == "__main__":
-    run()
+    App().run()
